@@ -25,25 +25,25 @@ import (
 )
 
 // createBackup creates a timestamped backup of the current config file
-func (r *Repository) createBackup() error {
-	if _, err := r.fileSystem.Stat(r.configPath); os.IsNotExist(err) {
+func (r *Repository) createBackup(configPath string) error {
+	if _, err := r.fileSystem.Stat(configPath); os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("failed to check if config file exists: %w", err)
 	}
 
 	timestamp := time.Now().UnixMilli()
-	backupPath := fmt.Sprintf("%s-%d-%s", r.configPath, timestamp, BackupSuffix)
+	backupPath := fmt.Sprintf("%s-%d-%s", configPath, timestamp, BackupSuffix)
 
-	if err := r.copyFile(r.configPath, backupPath); err != nil {
+	if err := r.copyFile(configPath, backupPath); err != nil {
 		return fmt.Errorf("failed to copy config to backup: %w", err)
 	}
 
 	r.logger.Infof("Created backup: %s", backupPath)
 
-	configDir := filepath.Dir(r.configPath)
+	configDir := filepath.Dir(configPath)
 
-	backupFiles, err := r.findBackupFiles(configDir)
+	backupFiles, err := r.findBackupFiles(configDir, configPath)
 	if err != nil {
 		return err
 	}
@@ -103,17 +103,18 @@ func (r *Repository) copyFile(src, dst string) error {
 }
 
 // findBackupFiles finds all backup files for the given config file
-func (r *Repository) findBackupFiles(dir string) ([]os.FileInfo, error) {
+func (r *Repository) findBackupFiles(dir, configPath string) ([]os.FileInfo, error) {
 	entries, err := r.fileSystem.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
 
 	var backupFiles []os.FileInfo
+	backupPrefix := filepath.Base(configPath) + "-"
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if strings.HasSuffix(name, BackupSuffix) {
+		if strings.HasPrefix(name, backupPrefix) && strings.HasSuffix(name, BackupSuffix) {
 			info, err := entry.Info()
 			if err != nil {
 				r.logger.Warnf("failed to get info for backup file %s: %v", name, err)
@@ -127,16 +128,17 @@ func (r *Repository) findBackupFiles(dir string) ([]os.FileInfo, error) {
 }
 
 // createOriginalBackupIfNeeded creates a one-time original backup of the current SSH config.
-func (r *Repository) createOriginalBackupIfNeeded() error {
+func (r *Repository) createOriginalBackupIfNeeded(configPath string) error {
 	// If no SSH config file, nothing to do.
-	if _, err := r.fileSystem.Stat(r.configPath); os.IsNotExist(err) {
+	if _, err := r.fileSystem.Stat(configPath); os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("failed to check if config file exists: %w", err)
 	}
 
-	configDir := filepath.Dir(r.configPath)
-	originalBackupPath := filepath.Join(configDir, OriginalBackupName)
+	configDir := filepath.Dir(configPath)
+	baseName := filepath.Base(configPath)
+	originalBackupPath := filepath.Join(configDir, fmt.Sprintf("%s.original.backup", baseName))
 
 	if _, err := r.fileSystem.Stat(originalBackupPath); err == nil {
 		return nil
@@ -144,7 +146,7 @@ func (r *Repository) createOriginalBackupIfNeeded() error {
 		return fmt.Errorf("failed to check if original backup exists: %w", err)
 	}
 
-	if err := r.copyFile(r.configPath, originalBackupPath); err != nil {
+	if err := r.copyFile(configPath, originalBackupPath); err != nil {
 		return fmt.Errorf("failed to create original backup: %w", err)
 	}
 

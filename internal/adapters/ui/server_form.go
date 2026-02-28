@@ -55,7 +55,7 @@ type ServerForm struct {
 	tabAbbrev     map[string]string // Abbreviated tab names for narrow views
 	mode          ServerFormMode
 	original      *domain.Server
-	onSave        func(domain.Server, *domain.Server)
+	onSave        func(domain.Server, *domain.Server, string)
 	onCancel      func()
 	app           *tview.Application // Reference to app for showing modals
 	version       string             // Version for header
@@ -1936,7 +1936,7 @@ func (sf *ServerForm) handleSave() bool {
 
 	server := sf.dataToServer(data)
 	if sf.onSave != nil {
-		sf.onSave(server, sf.original)
+		sf.onSave(server, sf.original, "")
 	}
 	return true // Save successful
 }
@@ -2253,12 +2253,15 @@ func (sf *ServerForm) dataToServer(data ServerFormData) domain.Server {
 		server.SSHCount = sf.original.SSHCount
 		// Also preserve Aliases (computed field)
 		server.Aliases = sf.original.Aliases
+		// Preserve source metadata for update/delete routing.
+		server.SourceFile = sf.original.SourceFile
+		server.ReadOnly = sf.original.ReadOnly
 	}
 
 	return server
 }
 
-func (sf *ServerForm) OnSave(fn func(domain.Server, *domain.Server)) *ServerForm {
+func (sf *ServerForm) OnSave(fn func(domain.Server, *domain.Server, string)) *ServerForm {
 	sf.onSave = fn
 	return sf
 }

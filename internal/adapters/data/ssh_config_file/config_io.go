@@ -26,16 +26,20 @@ import (
 // loadConfig reads and parses the SSH config file.
 // If the file does not exist, it returns an empty config without error to support first-run behavior.
 func (r *Repository) loadConfig() (*ssh_config.Config, error) {
-	file, err := r.fileSystem.Open(r.configPath)
+	return r.loadConfigFromPath(r.configPath)
+}
+
+func (r *Repository) loadConfigFromPath(path string) (*ssh_config.Config, error) {
+	file, err := r.fileSystem.Open(path)
 	if err != nil {
 		if r.fileSystem.IsNotExist(err) {
 			return &ssh_config.Config{Hosts: []*ssh_config.Host{}}, nil
 		}
-		return nil, fmt.Errorf("failed to open config file: %w", err)
+		return nil, fmt.Errorf("failed to open config file %s: %w", path, err)
 	}
 	defer func() {
 		if cerr := file.Close(); cerr != nil {
-			r.logger.Warnf("failed to close config file: %v", cerr)
+			r.logger.Warnf("failed to close config file %s: %v", path, cerr)
 		}
 	}()
 
@@ -49,7 +53,11 @@ func (r *Repository) loadConfig() (*ssh_config.Config, error) {
 
 // saveConfig writes the SSH config back to the file with atomic operations and backup management.
 func (r *Repository) saveConfig(cfg *ssh_config.Config) error {
-	configDir := filepath.Dir(r.configPath)
+	return r.saveConfigToPath(r.configPath, cfg)
+}
+
+func (r *Repository) saveConfigToPath(path string, cfg *ssh_config.Config) error {
+	configDir := filepath.Dir(path)
 
 	tempFile, err := r.createTempFile(configDir)
 	if err != nil {
@@ -67,19 +75,19 @@ func (r *Repository) saveConfig(cfg *ssh_config.Config) error {
 	}
 
 	// Ensure a one-time original backup exists before any modifications managed by lazyssh.
-	if err := r.createOriginalBackupIfNeeded(); err != nil {
+	if err := r.createOriginalBackupIfNeeded(path); err != nil {
 		return fmt.Errorf("failed to create original backup: %w", err)
 	}
 
-	if err := r.createBackup(); err != nil {
+	if err := r.createBackup(path); err != nil {
 		return fmt.Errorf("failed to create backup: %w", err)
 	}
 
-	if err := r.fileSystem.Rename(tempFile, r.configPath); err != nil {
+	if err := r.fileSystem.Rename(tempFile, path); err != nil {
 		return fmt.Errorf("failed to atomically replace config file: %w", err)
 	}
 
-	r.logger.Infof("SSH config successfully updated: %s", r.configPath)
+	r.logger.Infof("SSH config successfully updated: %s", path)
 	return nil
 }
 
