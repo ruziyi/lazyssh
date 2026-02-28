@@ -16,6 +16,9 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -235,10 +238,16 @@ func (t *tui) handleServerSelectionChange(server domain.Server) {
 }
 
 func (t *tui) handleServerAdd() {
+	t.showAddTargetPicker()
+}
+
+func (t *tui) openAddServerForm(targetFile string) {
 	form := NewServerForm(ServerFormAdd, nil).
 		SetApp(t.app).
 		SetVersionInfo(t.version, t.commit).
-		OnSave(t.handleServerSave).
+		OnSave(func(server domain.Server, original *domain.Server, _ string) {
+			t.handleServerSave(server, original, targetFile)
+		}).
 		OnCancel(t.handleFormCancel)
 	t.app.SetRoot(form, true)
 }
@@ -254,14 +263,14 @@ func (t *tui) handleServerEdit() {
 	}
 }
 
-func (t *tui) handleServerSave(server domain.Server, original *domain.Server) {
+func (t *tui) handleServerSave(server domain.Server, original *domain.Server, targetFile string) {
 	var err error
 	if original != nil {
 		// Edit mode
 		err = t.serverService.UpdateServer(*original, server)
 	} else {
 		// Add mode
-		err = t.serverService.AddServer(server)
+		err = t.serverService.AddServer(server, targetFile)
 	}
 	if err != nil {
 		// Stay on form; show a small modal with the error
@@ -275,6 +284,81 @@ func (t *tui) handleServerSave(server domain.Server, original *domain.Server) {
 
 	t.refreshServerList()
 	t.handleFormCancel()
+}
+
+func (t *tui) showAddTargetPicker() {
+	targets, err := t.getAddTargetOptions()
+	if err != nil {
+		t.showStatusTempColor(fmt.Sprintf("Failed to load config targets: %v", err), "#FF6B6B")
+		return
+	}
+
+	if len(targets) == 1 {
+		t.openAddServerForm(targets[0])
+		return
+	}
+
+	list := tview.NewList()
+	list.ShowSecondaryText(false)
+	list.SetBorder(true).
+		SetTitle(" Select Target Config File ").
+		SetTitleAlign(tview.AlignCenter)
+
+	for _, target := range targets {
+		targetPath := target
+		list.AddItem(targetPath, "", 0, func() {
+			t.openAddServerForm(targetPath)
+		})
+	}
+
+	list.AddItem("Cancel", "", 0, func() {
+		t.returnToMain()
+	})
+
+	list.SetDoneFunc(func() {
+		t.returnToMain()
+	})
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			t.returnToMain()
+			return nil
+		}
+		return event
+	})
+
+	t.app.SetRoot(list, true)
+	t.app.SetFocus(list)
+}
+
+func (t *tui) getAddTargetOptions() ([]string, error) {
+	targets, err := t.serverService.ListConfigFiles()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(targets) == 0 {
+		mainConfig, defaultErr := defaultSSHConfigPath()
+		if defaultErr != nil {
+			return nil, defaultErr
+		}
+		targets = []string{mainConfig}
+	}
+
+	for i := range targets {
+		targets[i] = filepath.Clean(targets[i])
+	}
+
+	sort.Strings(targets)
+
+	return targets, nil
+}
+
+func defaultSSHConfigPath() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, ".ssh", "config"), nil
 }
 
 func (t *tui) handleServerDelete() {
@@ -332,6 +416,12 @@ func (t *tui) handleRefreshBackground() {
 			})
 			return
 		}
+
+		enriched, enrichErr := t.serverService.EnrichIPLocation(servers)
+		if len(enriched) > 0 {
+			servers = enriched
+		}
+
 		sortServersForUI(servers, t.sortMode)
 		t.app.QueueUpdateDraw(func() {
 			t.serverList.UpdateServers(servers)
@@ -341,6 +431,10 @@ func (t *tui) handleRefreshBackground() {
 				if srv, ok := t.serverList.GetSelectedServer(); ok {
 					t.details.UpdateServer(srv)
 				}
+			}
+			if enrichErr != nil {
+				t.showStatusTempColor(fmt.Sprintf("Refreshed %d servers (IP partial: %s)", len(servers), shortError(enrichErr)), "#FFD37A")
+				return
 			}
 			t.showStatusTemp(fmt.Sprintf("Refreshed %d servers", len(servers)))
 		})
@@ -580,11 +674,54 @@ func (t *tui) refreshServerList() {
 	}
 	filtered, _ := t.serverService.ListServers(query)
 	sortServersForUI(filtered, t.sortMode)
+	prevIdx := t.serverList.GetCurrentItem()
 	t.serverList.UpdateServers(filtered)
+
+	if len(filtered) == 0 {
+		return
+	}
+
+	base := append([]domain.Server(nil), filtered...)
+	go func(snapshot []domain.Server, idx int) {
+		enriched, err := t.serverService.EnrichIPLocation(snapshot)
+		if len(enriched) == 0 {
+			if err != nil {
+				t.app.QueueUpdateDraw(func() {
+					t.showStatusTempColor("IP location: "+shortError(err), "#FFD37A")
+				})
+			}
+			return
+		}
+
+		sortServersForUI(enriched, t.sortMode)
+		t.app.QueueUpdateDraw(func() {
+			t.serverList.UpdateServers(enriched)
+			if idx >= 0 && idx < t.serverList.List.GetItemCount() {
+				t.serverList.SetCurrentItem(idx)
+				if srv, ok := t.serverList.GetSelectedServer(); ok {
+					t.details.UpdateServer(srv)
+				}
+			}
+			if err != nil {
+				t.showStatusTempColor("IP location partial: "+shortError(err), "#FFD37A")
+			}
+		})
+	}(base, prevIdx)
 }
 
 func (t *tui) returnToMain() {
 	t.app.SetRoot(t.root, true)
+}
+
+func shortError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	if len(msg) > 72 {
+		return msg[:72] + "..."
+	}
+	return msg
 }
 
 // showStatusTemp displays a temporary message in the status bar (default green) and then restores the default text.

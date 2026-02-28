@@ -132,10 +132,8 @@ func (t *tui) bindEvents() *tui {
 }
 
 func (t *tui) loadInitialData() *tui {
-	servers, _ := t.serverService.ListServers("")
-	sortServersForUI(servers, t.sortMode)
 	t.updateListTitle()
-	t.serverList.UpdateServers(servers)
+	t.refreshServerList()
 
 	return t
 }

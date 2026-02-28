@@ -24,43 +24,51 @@ import (
 )
 
 // toDomainServer converts ssh_config.Config to a slice of domain.Server.
-func (r *Repository) toDomainServer(cfg *ssh_config.Config) []domain.Server {
+func (r *Repository) toDomainServer(cfg *ssh_config.Config, sourceFile string) []domain.Server {
 	servers := make([]domain.Server, 0, len(cfg.Hosts))
 	for _, host := range cfg.Hosts {
-
-		aliases := make([]string, 0, len(host.Patterns))
-
-		for _, pattern := range host.Patterns {
-			alias := pattern.String()
-			// Skip if alias contains wildcards (not a concrete Host)
-			if strings.ContainsAny(alias, "!*?[]") {
-				continue
-			}
-			aliases = append(aliases, alias)
-		}
-		if len(aliases) == 0 {
+		server, ok := r.toDomainServerFromHost(host, sourceFile)
+		if !ok {
 			continue
 		}
-		server := domain.Server{
-			Alias:         aliases[0],
-			Aliases:       aliases,
-			Port:          22,
-			IdentityFiles: []string{},
-		}
-
-		for _, node := range host.Nodes {
-			kvNode, ok := node.(*ssh_config.KV)
-			if !ok {
-				continue
-			}
-
-			r.mapKVToServer(&server, kvNode)
-		}
-
 		servers = append(servers, server)
 	}
 
 	return servers
+}
+
+func (r *Repository) toDomainServerFromHost(host *ssh_config.Host, sourceFile string) (domain.Server, bool) {
+	aliases := make([]string, 0, len(host.Patterns))
+
+	for _, pattern := range host.Patterns {
+		alias := pattern.String()
+		// Skip if alias contains wildcards (not a concrete Host)
+		if strings.ContainsAny(alias, "!*?[]") {
+			continue
+		}
+		aliases = append(aliases, alias)
+	}
+	if len(aliases) == 0 {
+		return domain.Server{}, false
+	}
+	server := domain.Server{
+		Alias:         aliases[0],
+		Aliases:       aliases,
+		Port:          22,
+		IdentityFiles: []string{},
+		SourceFile:    sourceFile,
+	}
+
+	for _, node := range host.Nodes {
+		kvNode, ok := node.(*ssh_config.KV)
+		if !ok {
+			continue
+		}
+
+		r.mapKVToServer(&server, kvNode)
+	}
+
+	return server, true
 }
 
 // mapKVToServer maps an ssh_config.KV node to the corresponding fields in domain.Server.
@@ -299,6 +307,8 @@ func (r *Repository) mergeMetadata(servers []domain.Server, metadata map[string]
 		if meta, exists := metadata[server.Alias]; exists {
 			servers[i].Tags = meta.Tags
 			servers[i].SSHCount = meta.SSHCount
+			servers[i].ResolvedIP = meta.ResolvedIP
+			servers[i].IPLocationShort = meta.IPLocationShort
 
 			if meta.LastSeen != "" {
 				if lastSeen, err := time.Parse(time.RFC3339, meta.LastSeen); err == nil {
@@ -309,6 +319,12 @@ func (r *Repository) mergeMetadata(servers []domain.Server, metadata map[string]
 			if meta.PinnedAt != "" {
 				if pinnedAt, err := time.Parse(time.RFC3339, meta.PinnedAt); err == nil {
 					servers[i].PinnedAt = pinnedAt
+				}
+			}
+
+			if meta.IPLocationUpdatedAt != "" {
+				if updatedAt, err := time.Parse(time.RFC3339, meta.IPLocationUpdatedAt); err == nil {
+					servers[i].IPLocationUpdatedAt = updatedAt
 				}
 			}
 		}

@@ -18,9 +18,11 @@ import "github.com/Adembc/lazyssh/internal/core/domain"
 
 type ServerRepository interface {
 	ListServers(query string) ([]domain.Server, error)
+	ListConfigFiles() ([]string, error)
 	UpdateServer(server domain.Server, newServer domain.Server) error
-	AddServer(server domain.Server) error
+	AddServer(server domain.Server, targetFile string) error
 	DeleteServer(server domain.Server) error
 	SetPinned(alias string, pinned bool) error
 	RecordSSH(alias string) error
+	UpdateIPLocationMetadata(updates map[string]domain.IPLocationCache) error
 }

@@ -16,8 +16,14 @@ package services
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -33,9 +39,25 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	defaultGeoIPBaseURL = "http://ip-api.com/json"
+	defaultGeoIPWhois   = "https://ipwho.is"
+	geoIPFields         = "status,countryCode,region,query,message"
+	geoIPRequestTimeout = 1500 * time.Millisecond
+	geoIPCacheTTL       = 24 * time.Hour
+	geoIPConcurrency    = 5
+)
+
 type serverService struct {
 	serverRepository ports.ServerRepository
 	logger           *zap.SugaredLogger
+
+	httpClient        *http.Client
+	directHTTPClient  *http.Client
+	geoIPBaseURL      string
+	geoIPWhoisBaseURL string
+	now               func() time.Time
+	lookupIP          func(host string) ([]net.IP, error)
 
 	fwMu     sync.Mutex
 	forwards map[string][]*os.Process
@@ -43,9 +65,18 @@ type serverService struct {
 
 // NewServerService creates a new instance of serverService.
 func NewServerService(logger *zap.SugaredLogger, sr ports.ServerRepository) ports.ServerService {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+
 	return &serverService{
-		logger:           logger,
-		serverRepository: sr,
+		logger:            logger,
+		serverRepository:  sr,
+		httpClient:        &http.Client{Timeout: geoIPRequestTimeout},
+		directHTTPClient:  &http.Client{Timeout: geoIPRequestTimeout, Transport: transport},
+		geoIPBaseURL:      defaultGeoIPBaseURL,
+		geoIPWhoisBaseURL: defaultGeoIPWhois,
+		now:               time.Now,
+		lookupIP:          net.LookupIP,
 	}
 }
 
@@ -71,6 +102,86 @@ func (s *serverService) ListServers(query string) ([]domain.Server, error) {
 	})
 
 	return servers, nil
+}
+
+func (s *serverService) EnrichIPLocation(servers []domain.Server) ([]domain.Server, error) {
+	if len(servers) == 0 {
+		return servers, nil
+	}
+
+	enriched := append([]domain.Server(nil), servers...)
+	updates := make(map[string]domain.IPLocationCache)
+	var updateMu sync.Mutex
+	var failMu sync.Mutex
+	failCount := 0
+	var firstErr error
+
+	sem := make(chan struct{}, geoIPConcurrency)
+	var wg sync.WaitGroup
+	now := s.now()
+
+	for i := range enriched {
+		server := enriched[i]
+		if strings.TrimSpace(server.Alias) == "" {
+			continue
+		}
+
+		wg.Add(1)
+		go func(idx int, srv domain.Server) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			cache, ok, resolveErr := s.resolveIPLocationCache(srv, now)
+			if resolveErr != nil {
+				s.logger.Debugw("resolve ip location failed", "alias", srv.Alias, "error", resolveErr)
+				failMu.Lock()
+				failCount++
+				if firstErr == nil {
+					firstErr = resolveErr
+				}
+				failMu.Unlock()
+			}
+			if !ok {
+				return
+			}
+
+			updateMu.Lock()
+			enriched[idx].ResolvedIP = cache.ResolvedIP
+			enriched[idx].IPLocationShort = cache.IPLocationShort
+			enriched[idx].IPLocationUpdatedAt = cache.IPLocationUpdatedAt
+			updates[srv.Alias] = cache
+			updateMu.Unlock()
+		}(i, server)
+	}
+
+	wg.Wait()
+	if len(updates) == 0 {
+		if failCount > 0 {
+			return enriched, fmt.Errorf("ip location update failed for %d servers: %w", failCount, firstErr)
+		}
+		return enriched, nil
+	}
+
+	if err := s.serverRepository.UpdateIPLocationMetadata(updates); err != nil {
+		s.logger.Warnw("failed to persist ip location metadata", "error", err, "count", len(updates))
+		return enriched, err
+	}
+
+	if failCount > 0 {
+		return enriched, fmt.Errorf("ip location partially updated, failed: %d, first error: %w", failCount, firstErr)
+	}
+
+	return enriched, nil
+}
+
+func (s *serverService) ListConfigFiles() ([]string, error) {
+	files, err := s.serverRepository.ListConfigFiles()
+	if err != nil {
+		s.logger.Errorw("failed to list config files", "error", err)
+		return nil, err
+	}
+	return files, nil
 }
 
 // validateServer performs core validation of server fields.
@@ -123,12 +234,12 @@ func (s *serverService) UpdateServer(server domain.Server, newServer domain.Serv
 }
 
 // AddServer adds a new server to the repository.
-func (s *serverService) AddServer(server domain.Server) error {
+func (s *serverService) AddServer(server domain.Server, targetFile string) error {
 	if err := validateServer(server); err != nil {
 		s.logger.Warnw("validation failed on add", "error", err, "server", server)
 		return err
 	}
-	err := s.serverRepository.AddServer(server)
+	err := s.serverRepository.AddServer(server, targetFile)
 	if err != nil {
 		s.logger.Errorw("failed to add server", "error", err, "server", server)
 	}
@@ -376,4 +487,267 @@ func resolveSSHDestination(alias string) (string, int, bool) {
 		port = 22
 	}
 	return host, port, true
+}
+
+func (s *serverService) resolveIPLocationCache(server domain.Server, now time.Time) (domain.IPLocationCache, bool, error) {
+	host := strings.TrimSpace(server.Host)
+	if host == "" {
+		host = strings.TrimSpace(server.Alias)
+	}
+	if host == "" {
+		return domain.IPLocationCache{}, false, nil
+	}
+
+	resolvedIP, isPrivate, err := s.resolveTargetIP(host)
+	if err != nil {
+		return domain.IPLocationCache{}, false, fmt.Errorf("resolve host %q ip: %w", host, err)
+	}
+
+	if !shouldRefreshIPLocation(server, resolvedIP, now) {
+		return domain.IPLocationCache{}, false, nil
+	}
+
+	if isPrivate {
+		return domain.IPLocationCache{
+			ResolvedIP:          resolvedIP,
+			IPLocationShort:     "LAN",
+			IPLocationUpdatedAt: now,
+		}, true, nil
+	}
+
+	location, err := s.fetchIPLocationShort(resolvedIP)
+	if err != nil {
+		return domain.IPLocationCache{}, false, fmt.Errorf("fetch geo location for %s: %w", resolvedIP, err)
+	}
+
+	return domain.IPLocationCache{
+		ResolvedIP:          resolvedIP,
+		IPLocationShort:     location,
+		IPLocationUpdatedAt: now,
+	}, true, nil
+}
+
+func shouldRefreshIPLocation(server domain.Server, resolvedIP string, now time.Time) bool {
+	if strings.TrimSpace(resolvedIP) == "" {
+		return false
+	}
+	if strings.TrimSpace(server.ResolvedIP) != strings.TrimSpace(resolvedIP) {
+		return true
+	}
+	if strings.TrimSpace(server.IPLocationShort) == "" {
+		return true
+	}
+	if server.IPLocationUpdatedAt.IsZero() {
+		return true
+	}
+	return now.Sub(server.IPLocationUpdatedAt) >= geoIPCacheTTL
+}
+
+func (s *serverService) resolveTargetIP(host string) (string, bool, error) {
+	if parsed := net.ParseIP(host); parsed != nil {
+		normalized := normalizeIP(parsed)
+		return normalized, isPrivateOrLocalIP(parsed), nil
+	}
+
+	ips, err := s.lookupIP(host)
+	if err != nil {
+		return "", false, err
+	}
+	if len(ips) == 0 {
+		return "", false, fmt.Errorf("no ip resolved for host %q", host)
+	}
+
+	var privateFallback string
+	for _, ip := range ips {
+		if ip == nil {
+			continue
+		}
+		normalized := normalizeIP(ip)
+		if normalized == "" {
+			continue
+		}
+		if isPrivateOrLocalIP(ip) {
+			if privateFallback == "" {
+				privateFallback = normalized
+			}
+			continue
+		}
+		return normalized, false, nil
+	}
+
+	if privateFallback != "" {
+		return privateFallback, true, nil
+	}
+
+	return "", false, fmt.Errorf("no usable ip resolved for host %q", host)
+}
+
+func normalizeIP(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.String()
+}
+
+func isPrivateOrLocalIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		return true
+	}
+	return ip.IsPrivate()
+}
+
+func (s *serverService) fetchIPLocationShort(ip string) (string, error) {
+	clients := make([]*http.Client, 0, 2)
+	if s.httpClient != nil {
+		clients = append(clients, s.httpClient)
+	}
+	if s.directHTTPClient != nil {
+		clients = append(clients, s.directHTTPClient)
+	}
+	if len(clients) == 0 {
+		clients = append(clients, &http.Client{Timeout: geoIPRequestTimeout})
+	}
+
+	var errs []error
+	for _, client := range clients {
+		location, err := s.fetchFromIPAPI(client, ip)
+		if err == nil {
+			return location, nil
+		}
+		errs = append(errs, err)
+	}
+
+	for _, client := range clients {
+		location, err := s.fetchFromIPWhois(client, ip)
+		if err == nil {
+			return location, nil
+		}
+		errs = append(errs, err)
+	}
+
+	return "", fmt.Errorf("geo lookup failed: %v", errs)
+}
+
+func (s *serverService) fetchFromIPAPI(client *http.Client, ip string) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(s.geoIPBaseURL), "/")
+	if base == "" {
+		base = defaultGeoIPBaseURL
+	}
+
+	endpoint := fmt.Sprintf("%s/%s", base, neturl.PathEscape(ip))
+	ctx, cancel := context.WithTimeout(context.Background(), geoIPRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return "", fmt.Errorf("geoip status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Status      string `json:"status"`
+		Country     string `json:"country"`
+		CountryCode string `json:"countryCode"`
+		Region      string `json:"region"`
+		RegionName  string `json:"regionregionName"`
+		Query       string `json:"query"`
+		Message     string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if strings.ToLower(payload.Status) != "success" {
+		if payload.Message == "" {
+			payload.Message = "unknown geoip error"
+		}
+		return "", errors.New(payload.Message)
+	}
+
+	country := strings.ToUpper(strings.TrimSpace(payload.Country))
+	region := strings.ToUpper(strings.TrimSpace(payload.RegionName))
+	if country == "" {
+		return "", fmt.Errorf("geoip response missing country code for %s", ip)
+	}
+	if region == "" {
+		region = "--"
+	}
+
+	return country + "/" + region, nil
+}
+
+func (s *serverService) fetchFromIPWhois(client *http.Client, ip string) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(s.geoIPWhoisBaseURL), "/")
+	if base == "" {
+		base = defaultGeoIPWhois
+	}
+	endpoint := fmt.Sprintf("%s/%s", base, neturl.PathEscape(ip))
+	ctx, cancel := context.WithTimeout(context.Background(), geoIPRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return "", fmt.Errorf("ipwhois status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Success     bool   `json:"success"`
+		CountryCode string `json:"country_code"`
+		RegionCode  string `json:"region_code"`
+		Error       struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if !payload.Success {
+		msg := strings.TrimSpace(payload.Error.Message)
+		if msg == "" {
+			msg = strings.TrimSpace(payload.Message)
+		}
+		if msg == "" {
+			msg = "unknown ipwhois error"
+		}
+		return "", errors.New(msg)
+	}
+
+	country := strings.ToUpper(strings.TrimSpace(payload.CountryCode))
+	region := strings.ToUpper(strings.TrimSpace(payload.RegionCode))
+	if country == "" {
+		return "", fmt.Errorf("ipwhois response missing country code for %s", ip)
+	}
+	if region == "" {
+		region = "--"
+	}
+	return country + "/" + region, nil
 }

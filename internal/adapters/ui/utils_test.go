@@ -171,3 +171,16 @@ func TestBuildSSHCommand_CompleteCommand(t *testing.T) {
 		t.Errorf("Command should contain 'admin@example.com', got: %q", result)
 	}
 }
+
+func TestFormatServerLine_IncludesIPLocation(t *testing.T) {
+	server := domain.Server{
+		Alias:           "prod",
+		Host:            "8.8.8.8",
+		IPLocationShort: "US/CA",
+	}
+
+	primary, _ := formatServerLine(server)
+	if !strings.Contains(primary, "US/CA") {
+		t.Fatalf("expected list line to include location US/CA, got: %q", primary)
+	}
+}

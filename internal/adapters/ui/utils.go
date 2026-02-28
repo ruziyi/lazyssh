@@ -83,6 +83,10 @@ func pinnedIcon(pinnedAt time.Time) string {
 
 func formatServerLine(s domain.Server) (primary, secondary string) {
 	icon := cellPad(pinnedIcon(s.PinnedAt), 2)
+	location := strings.TrimSpace(s.IPLocationShort)
+	if location == "" {
+		location = "--/--"
+	}
 	// forwarding column after Host/IP
 	fGlyph := ""
 	isFwd := IsForwarding != nil && IsForwarding(s.Alias)
@@ -93,8 +97,17 @@ func formatServerLine(s domain.Server) (primary, secondary string) {
 	if isFwd {
 		fCol = "[#A0FFA0]" + fCol + "[-]"
 	}
-	// Use a consistent color for alias; host/IP fixed width; then forwarding column
-	primary = fmt.Sprintf("%s [white::b]%-12s[-] [#AAAAAA]%-18s[-] %s [#888888]Last SSH: %s[-]  %s", icon, s.Alias, s.Host, fCol, humanizeDuration(s.LastSeen), renderTagBadgesForList(s.Tags))
+	// Use a consistent color for alias; host/IP fixed width; then location and forwarding columns.
+	primary = fmt.Sprintf(
+		"%s [white::b]%-12s[-] [#AAAAAA]%-18s[-] [#88AADD]%-6s[-] %s [#888888]Last SSH: %s[-]  %s",
+		icon,
+		s.Alias,
+		s.Host,
+		location,
+		fCol,
+		humanizeDuration(s.LastSeen),
+		renderTagBadgesForList(s.Tags),
+	)
 	secondary = ""
 	return
 }

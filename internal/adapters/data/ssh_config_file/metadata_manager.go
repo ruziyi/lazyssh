@@ -26,10 +26,13 @@ import (
 )
 
 type ServerMetadata struct {
-	Tags     []string `json:"tags,omitempty"`
-	LastSeen string   `json:"last_seen,omitempty"`
-	PinnedAt string   `json:"pinned_at,omitempty"`
-	SSHCount int      `json:"ssh_count,omitempty"`
+	Tags                []string `json:"tags,omitempty"`
+	LastSeen            string   `json:"last_seen,omitempty"`
+	PinnedAt            string   `json:"pinned_at,omitempty"`
+	SSHCount            int      `json:"ssh_count,omitempty"`
+	ResolvedIP          string   `json:"resolved_ip,omitempty"`
+	IPLocationShort     string   `json:"ip_location_short,omitempty"`
+	IPLocationUpdatedAt string   `json:"ip_location_updated_at,omitempty"`
 }
 
 type metadataManager struct {
@@ -161,6 +164,30 @@ func (m *metadataManager) recordSSH(alias string) error {
 	meta.SSHCount++
 
 	metadata[alias] = meta
+	return m.saveAll(metadata)
+}
+
+func (m *metadataManager) updateIPLocations(updates map[string]domain.IPLocationCache) error {
+	if len(updates) == 0 {
+		return nil
+	}
+
+	metadata, err := m.loadAll()
+	if err != nil {
+		m.logger.Errorw("failed to load metadata in updateIPLocations", "path", m.filePath, "error", err)
+		return fmt.Errorf("load metadata: %w", err)
+	}
+
+	for alias, update := range updates {
+		meta := metadata[alias]
+		meta.ResolvedIP = update.ResolvedIP
+		meta.IPLocationShort = update.IPLocationShort
+		if !update.IPLocationUpdatedAt.IsZero() {
+			meta.IPLocationUpdatedAt = update.IPLocationUpdatedAt.Format(time.RFC3339)
+		}
+		metadata[alias] = meta
+	}
+
 	return m.saveAll(metadata)
 }
 

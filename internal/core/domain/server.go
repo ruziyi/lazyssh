@@ -16,6 +16,12 @@ package domain
 
 import "time"
 
+type IPLocationCache struct {
+	ResolvedIP          string
+	IPLocationShort     string
+	IPLocationUpdatedAt time.Time
+}
+
 type Server struct {
 	Alias         string
 	Aliases       []string
@@ -114,4 +120,13 @@ type Server struct {
 
 	// Debugging settings
 	LogLevel string
+
+	// Source tracking (in-memory only, not persisted to SSH config)
+	SourceFile string // config file path; empty = main ~/.ssh/config
+	ReadOnly   bool   // true for servers from Include'd files
+
+	// IP location metadata (in-memory + metadata cache, not persisted to SSH config).
+	ResolvedIP          string
+	IPLocationShort     string
+	IPLocationUpdatedAt time.Time
 }

@@ -22,8 +22,10 @@ import (
 
 type ServerService interface {
 	ListServers(query string) ([]domain.Server, error)
+	EnrichIPLocation(servers []domain.Server) ([]domain.Server, error)
+	ListConfigFiles() ([]string, error)
 	UpdateServer(server domain.Server, newServer domain.Server) error
-	AddServer(server domain.Server) error
+	AddServer(server domain.Server, targetFile string) error
 	DeleteServer(server domain.Server) error
 	SetPinned(alias string, pinned bool) error
 	SSH(alias string) error
